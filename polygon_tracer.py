@@ -12,6 +12,8 @@ from PIL import Image, ImageTk, ImageDraw
 import numpy as np
 import cv2
 import trimesh
+from scipy.spatial import Delaunay
+import cadquery as cq
 import os
 
 POINT_RADIUS = 6
@@ -219,7 +221,7 @@ class PolygonTracer:
         cv2.fillPoly(filled_img, [cv_pts], 255)
         cv2.imwrite(os.path.join(out_dir, "filled_2d.png"), filled_img)
 
-        # STL extrusion
+        # STL extrusion with proper triangulation
         pts_2d = pts.astype(float).copy()
         pts_2d[:, 1] = h - pts_2d[:, 1]
         bbox = pts_2d.max(axis=0) - pts_2d.min(axis=0)
@@ -227,33 +229,59 @@ class PolygonTracer:
         pts_2d = (pts_2d - pts_2d.min(axis=0)) * sc
 
         n = len(pts_2d)
+
+        # Triangulate caps using constrained Delaunay, filtering to
+        # only triangles whose centroid is inside the polygon.
+        tri = Delaunay(pts_2d)
+        cap_faces = []
+        poly_contour = pts_2d.reshape(-1, 1, 2).astype(np.float32)
+        for simplex in tri.simplices:
+            centroid = pts_2d[simplex].mean(axis=0)
+            if cv2.pointPolygonTest(poly_contour, centroid.tolist(), False) >= 0:
+                cap_faces.append(simplex)
+        cap_faces = np.array(cap_faces)
+
+        # Build vertices: bottom ring (0..n-1), top ring (n..2n-1)
         bottom = np.column_stack([pts_2d, np.zeros(n)])
         top = np.column_stack([pts_2d, np.full(n, EXTRUDE_HEIGHT)])
         verts = np.vstack([bottom, top])
 
         faces = []
+
+        # Side walls
         for i in range(n):
             j = (i + 1) % n
             faces.append([i, j, j + n])
             faces.append([i, j + n, i + n])
 
-        bot_c, top_c = bottom.mean(axis=0), top.mean(axis=0)
-        ci_b, ci_t = len(verts), len(verts) + 1
-        verts = np.vstack([verts, [bot_c], [top_c]])
-        for i in range(n):
-            j = (i + 1) % n
-            faces.append([ci_b, j, i])
-            faces.append([ci_t, i + n, j + n])
+        # Bottom cap (reverse winding so normals point down)
+        for f in cap_faces:
+            faces.append([f[0], f[2], f[1]])
+
+        # Top cap (offset indices by n, normal winding so normals point up)
+        for f in cap_faces:
+            faces.append([f[0] + n, f[1] + n, f[2] + n])
 
         mesh = trimesh.Trimesh(vertices=verts, faces=np.array(faces))
         mesh.fix_normals()
         mesh.export(os.path.join(out_dir, "case.stl"))
+
+        # STEP solid via cadquery (true B-rep, opens as native solid in CAD)
+        pts_cq = [tuple(p) for p in pts_2d.tolist()]
+        solid = (
+            cq.Workplane("XY")
+            .polyline(pts_cq)
+            .close()
+            .extrude(EXTRUDE_HEIGHT)
+        )
+        cq.exporters.export(solid, os.path.join(out_dir, "case.step"))
 
         dims = np.round(mesh.bounds[1] - mesh.bounds[0], 1)
         messagebox.showinfo("Saved", (
             f"edges_2d.png\n"
             f"filled_2d.png\n"
             f"case.stl ({len(mesh.faces)} faces)\n"
+            f"case.step (solid)\n"
             f"Size: {dims[0]} x {dims[1]} x {dims[2]} mm"))
         self.status.config(text=f"Saved to {out_dir}")
 
